@@ -1,248 +1,283 @@
-# Unidad 11 - Post Contenido 2: Sincronizacion Offline-First con Observabilidad
+Unidad 11 - Post Contenido 2: Sincronización Reactiva Offline-First con Telemetría
 
-App Android multi-modulo que extiende el feature de notas (post 1) con:
+Aplicación Android multi-módulo que amplía el feature de tareas desarrollado en el Post Contenido 1 incorporando persistencia local, sincronización offline-first y monitoreo mediante OpenTelemetry.
 
-- **Persistencia local** con Room (`:core:database`) y campo `syncStatus`.
-- **Sincronizacion offline-first** disparada por **WorkManager** con
-  retry exponencial (`:core:sync`).
-- **Resolucion de conflictos Last-Write-Wins (LWW)** en
-  `OfflineFirstNoteRepository`.
-- **Trazas OpenTelemetry** que registran cada ejecucion del sync con
-  atributos de diagnostico (`sync.attempt`, `sync.pending_count`,
-  `sync.outcome`).
+La aplicación implementa:
 
----
-
-## Diagrama del flujo offline-first
-
-```
-                +--------------+
-   Usuario ---> | NotesScreen  |
-                +-----+--------+
-                      | addNote / deleteNote
-                      v
-            +-----------------------+
-            | NotesViewModel        |   (StateFlow + SharedFlow del post 1)
-            +-----------+-----------+
+Persistencia local usando Room (:core:storage) con estados de sincronización.
+Sincronización automática utilizando WorkManager (:core:sync).
+Estrategia de resolución de conflictos Last-Update-Wins (LUW).
+Observabilidad mediante OpenTelemetry y LoggingSpanExporter.
+Arquitectura desacoplada y reactiva basada en Kotlin Flow.
+Flujo offline-first de sincronización
+                +----------------+
+ Usuario -----> | TaskScreen     |
+                +-------+--------+
                         |
+                        | createTask / deleteTask
                         v
-        +---------------------------------+
-        | OfflineFirstNoteRepository      |
-        |                                 |
-        |  1. upsert Room (PENDING)       |
-        |  2. syncTrigger.schedule()      |
-        +-----+------------------+--------+
-              |                  |
-              v                  v
-       +-------------+    +-------------------+
-       |  Room DAO   |    | SyncScheduler     |
-       | (notes.db)  |    | WorkManager       |
-       +------+------+    +---------+---------+
-              ^                     |
-              |                     v
-              |             +----------------+
-              |             | SyncWorker     |
-              |             | (instrumentado |
-              |             |  con OTel)     |
-              |             +----+-----------+
-              |                  |
-              |    markSynced    | upsertNote(DTO)
-              +------------------+----+
+            +-------------------------+
+            | TaskViewModel           |
+            | StateFlow + SharedFlow  |
+            +------------+------------+
+                         |
+                         v
+        +--------------------------------------+
+        | OfflineTaskRepository                |
+        |                                      |
+        | 1. guarda en Room (PENDING)          |
+        | 2. programa sincronizacion           |
+        +--------------+-----------------------+
+                       |
+          +------------+------------+
+          |                         |
+          v                         v
+   +-------------+          +------------------+
+   | Room DAO    |          | SyncManager      |
+   | tasks.db    |          | WorkManager      |
+   +------+------+          +---------+--------+
+          ^                            |
+          |                            v
+          |                   +----------------+
+          |                   | SyncWorker     |
+          |                   | OpenTelemetry  |
+          |                   +-------+--------+
+          |                           |
+          +---------------------------+
+                                      |
                                       v
-                              +-------------+
-                              | NoteApi     |
-                              | (mock /     |
-                              |  Retrofit)  |
-                              +-------------+
+                             +----------------+
+                             | Remote API     |
+                             | FakeTaskApi    |
+                             +----------------+
+Flujo completo offline-first
+1. Usuario crea tareas sin conexión
 
-    Logcat <-- LoggingSpanExporter <-- OpenTelemetry SDK
-```
+La aplicación:
 
-### Flujo end-to-end (escritura offline)
+Guarda localmente en Room.
+Marca las tareas como PENDING.
+Programa sincronización diferida.
+2. WorkManager espera conectividad
 
-1. Usuario crea una nota sin red.
-2. `OfflineFirstNoteRepository.addNote` la guarda en Room con
-   `syncStatus = PENDING` y llama `syncTrigger.schedule()`.
-3. WorkManager encola `SyncWorker` con la constraint
-   `NetworkType.CONNECTED` -- queda esperando red.
-4. El usuario activa WiFi. WorkManager dispara el Worker.
-5. `SyncWorker` abre el span `notes.sync` (atributo
-   `sync.attempt = 0`), lee las PENDING (`sync.pending_count = N`) y
-   las sube con `NoteApi.upsertNote`. Si una llamada falla con
-   `IOException`, marca `sync.outcome = retry` y devuelve `Result.retry()`;
-   WorkManager reintenta con backoff exponencial (15s, 30s, 60s).
-6. Cuando una nota se sube exitosamente, `NoteDao.markSynced(id)`
-   actualiza `syncStatus = SYNCED`. La UI se actualiza reactivamente
-   porque `getNotes()` expone un `Flow`.
+El SyncWorker se ejecuta únicamente cuando:
 
-### Algoritmo Last-Write-Wins (LWW)
+NetworkType.CONNECTED
 
-`OfflineFirstNoteRepository.refreshFromServer()` recorre las notas del
-servidor y compara timestamps:
+está disponible.
 
-| Caso                                              | Accion |
-|---------------------------------------------------|--------|
-| Nota no existe localmente                          | Insertar como `SYNCED`. |
-| Remoto `updatedAt` > Local `updatedAt`             | Sobrescribir; marcar `CONFLICT` (otro dispositivo edito). |
-| Remoto `updatedAt` <= Local `updatedAt`            | No tocar nada; el Worker subira la version local en el proximo ciclo. |
+3. Recuperación automática de red
 
-La precondicion para que LWW sea correcto es que todos los clientes
-sincronicen el reloj con NTP; de lo contrario hay riesgo de inversion.
+Cuando vuelve internet:
 
----
+WorkManager ejecuta SyncWorker.
+Las tareas pendientes se sincronizan.
+Room actualiza el estado a SYNCED.
+La UI se actualiza automáticamente mediante Flow.
+4. Manejo de errores y retry exponencial
 
-## Estructura de modulos
+Si ocurre un error de red:
 
-```
-NotesAppSync
-├── app                          # Configuracion + WorkManagerFactory + OTel init
-│   ├── data/OfflineFirstNoteRepository.kt   <-- aplica LWW
-│   ├── di/RepositoryModule.kt
-│   └── MainActivity.kt
+Result.retry()
+
+WorkManager aplica backoff exponencial:
+
+15s -> 30s -> 60s -> 120s
+Algoritmo Last-Update-Wins (LUW)
+
+OfflineTaskRepository.refreshFromServer() compara timestamps locales y remotos.
+
+Caso	Acción
+No existe localmente	Insertar
+Remoto más reciente	Sobrescribir
+Local más reciente	Mantener local
+Ejemplo de comparación
+if(remote.updatedAt > local.updatedAt) {
+    overwriteLocal()
+} else {
+    keepLocalVersion()
+}
+Estados de sincronización
+Estado	Significado
+PENDING	Cambios pendientes
+SYNCED	Sincronizado correctamente
+CONFLICT	Conflicto detectado
+Estructura multi-módulo
+TaskSyncApp
+├── app
+│   ├── data/OfflineTaskRepository.kt
+│   ├── di/AppModule.kt
+│   ├── MainActivity.kt
+│   └── TaskSyncApplication.kt
 │
 ├── core
-│   ├── domain          (JVM puro)   Note + SyncStatus + NoteRepository
-│   ├── ui              (Android lib) Theme Material3
-│   ├── database        (Android lib) Room: NoteEntity, NoteDao, AppDatabase
-│   ├── network         (Android lib) NoteApiService + FakeNoteApiService
-│   └── sync            (Android lib) SyncWorker, SyncScheduler, SyncTrigger,
-│                                     OpenTelemetryInitializer
+│   ├── domain
+│   │   ├── model/Task.kt
+│   │   ├── model/SyncStatus.kt
+│   │   └── repository/TaskRepository.kt
+│   │
+│   ├── ui
+│   │   └── theme/AppTheme.kt
+│   │
+│   ├── storage
+│   │   ├── TaskDao.kt
+│   │   ├── TaskEntity.kt
+│   │   └── AppDatabase.kt
+│   │
+│   ├── network
+│   │   ├── TaskApiService.kt
+│   │   └── FakeTaskApiService.kt
+│   │
+│   └── sync
+│       ├── SyncWorker.kt
+│       ├── SyncScheduler.kt
+│       ├── SyncTrigger.kt
+│       └── TelemetryInitializer.kt
 │
 └── feature
-    └── notes           NotesScreen muestra badge PENDING/SYNCED/CONFLICT
-                        y TopAppBar con accion "Sync" -> refreshFromServer().
-```
+    └── tasks
+        ├── TaskScreen.kt
+        ├── TaskViewModel.kt
+        ├── TaskUiState.kt
+        ├── TaskEvent.kt
+        └── components/
+Dependencias entre módulos
+:app -----------> :feature:tasks -----------> :core:domain
+   \                       \---------------> :core:ui
+    \
+     +------> :core:storage -------------> :core:domain
+     +------> :core:network -------------> :core:domain
+     +------> :core:sync
+Decisiones de diseño
+1. Abstracción SyncTrigger
 
-### Dependencias entre modulos
+El repositorio depende de:
 
-```
-:app -----> :feature:notes -----> :core:domain
-   \              \---------> :core:ui
-    \---> :core:database  ---> :core:domain
-    \---> :core:network   ---> :core:domain
-    \---> :core:sync      ---> :core:database
-                          \--> :core:network
-```
+interface SyncTrigger
 
----
+y NO directamente de WorkManager.
 
-## Decisiones de diseno
+Beneficios:
 
-### 1. `SyncTrigger` como abstraccion de WorkManager
+Fácil testing.
+Bajo acoplamiento.
+Independencia de Android Framework.
+2. Separación entre sincronización y conciliación
 
-`OfflineFirstNoteRepository` recibe un `SyncTrigger` (interfaz), no
-`SyncScheduler` (impl concreta). Esto permite **testear el repositorio
-sin WorkManager** (que requiere `Context`). En produccion Hilt enlaza
-`SyncTrigger` -> `SyncScheduler` mediante `SyncModule`.
+El SyncWorker:
 
-### 2. LWW se aplica al `refresh`, no al worker
+solo sube cambios locales.
 
-El Worker SOLO sube cambios locales. La conciliacion contra el
-servidor (que es donde aparecen los conflictos) se hace en
-`refreshFromServer()`, disparado por la UI con el boton "Sync" o por
-el `init` del ViewModel. Separar ambos roles mantiene el Worker
-simple y predecible.
+La reconciliación:
 
-### 3. `SyncStatus = CONFLICT` como senal a la UI
+ocurre en refreshFromServer().
 
-Cuando el servidor sobrescribe una nota local (porque tenia
-`updatedAt` mas reciente), la nota queda marcada `CONFLICT`. La UI
-muestra un badge rojo para que el usuario sepa que sus cambios
-locales se perdieron. Esto NO es "resolucion de conflictos
-automatica" pura -- es LWW con visibilidad.
+Esto mantiene el Worker simple y determinista.
 
-### 4. `LoggingSpanExporter` en vez de un backend OTel real
+3. Estado CONFLICT visible en UI
 
-Para que el laboratorio sea reproducible sin desplegar Jaeger o
-Honeycomb, los spans se exportan a Logcat con
-`LoggingSpanExporter`. Para conmutar a un backend OTLP basta con
-sustituir el exporter en `OpenTelemetryInitializer`.
+Cuando el servidor sobrescribe cambios locales:
 
-### 5. WorkManager con `Configuration.Provider` + HiltWorkerFactory
+syncStatus = CONFLICT
 
-`NotesApplication` implementa `Configuration.Provider` y se desactiva
-el `WorkManagerInitializer` por defecto en el manifest. Sin esto,
-`SyncWorker` no podria recibir `NoteDao` ni `NoteApiService` por
-constructor.
+La interfaz muestra:
 
----
+Badge rojo.
+Advertencia visual.
+Estado reactivo inmediato.
+4. OpenTelemetry con LoggingSpanExporter
 
-## Como ejecutar
+En lugar de usar Jaeger o Grafana:
 
-```powershell
-# Compilar todos los modulos
+LoggingSpanExporter.create()
+
+exporta spans directamente a Logcat.
+
+Ventajas:
+
+Laboratorio reproducible.
+Sin infraestructura externa.
+Fácil depuración local.
+5. WorkManager + Hilt
+
+TaskSyncApplication implementa:
+
+Configuration.Provider
+
+permitiendo inyección en:
+
+SyncWorker
+Ejecución del proyecto
+Compilar todos los módulos
 ./gradlew assembleDebug
-
-# Tests unitarios
+Ejecutar pruebas
 ./gradlew test
-
-# Tests especificos
+Ejecutar pruebas específicas
 ./gradlew :app:test
-./gradlew :feature:notes:test
-```
+./gradlew :feature:tasks:test
+Checkpoints / Evidencias
+Checkpoint 1 - Room configurado
 
-Abrir en Android Studio Hedgehog+ y ejecutar `:app` en un emulador con
-API 24+ con conexion de red disponible.
+La tabla tasks contiene:
 
----
+id
+title
+description
+updatedAt
+syncStatus
+Evidencia
+Checkpoint 1 - Room schema
+Checkpoint 2 - Sincronización automática
 
-## Checkpoints / Evidencias
+Pasos:
 
-### Checkpoint 1 - Esquema Room con `syncStatus`
+Activar modo avión.
+Crear tareas.
+Aparecen como PENDING.
+Restaurar internet.
+WorkManager sincroniza automáticamente.
+Estados cambian a SYNCED.
+Evidencia
+Checkpoint 2 - Sync Worker SUCCESS
+Checkpoint 3 - Resolución de conflictos
 
-Tras instalar la app, abrir **App Inspection > Database Inspector**.
-Tabla `notes` debe tener las columnas: `id`, `title`, `content`,
-`updatedAt`, `syncStatus`.
+El backend mock contiene datos con timestamps más recientes.
 
-![Checkpoint 1 - Room schema](screenshots/checkpoint1-room-schema.png)
+Resultado:
 
-### Checkpoint 2 - Sync exitoso al recuperar red
+syncStatus = CONFLICT
+Evidencia
+Checkpoint 3 - conflicto detectado
+Checkpoint 4 - OpenTelemetry en Logcat
 
-1. Activar modo avion en el emulador.
-2. Crear 2-3 notas (aparecen con badge **PENDING**).
-3. Desactivar modo avion.
-4. WorkManager dispara `SyncWorker`. En **App Inspection > Background Task Inspector**
-   el job `notes-sync` aparece en estado `SUCCEEDED`.
-5. Las notas pasan a badge **SYNCED** en la lista.
+Filtrar Logcat por:
 
-![Checkpoint 2 - Sync workmanager](screenshots/checkpoint2-sync-workmanager.png)
+LoggingSpanExporter
 
-### Checkpoint 3 - Resolucion LWW
+Salida esperada:
 
-El backend mock incluye una nota `remote-seed` con `updatedAt` en el
-futuro. Al primer `refresh`, esa nota aparece marcada **CONFLICT**
-(LWW: el servidor gano). Capturar la pantalla y/o el Database
-Inspector mostrando `syncStatus = 'CONFLICT'` para ese registro.
-
-![Checkpoint 3 - LWW](screenshots/checkpoint3-lww-conflict.png)
-
-### Checkpoint 4 - Spans de OpenTelemetry en Logcat
-
-Filtrar Logcat por el tag `LoggingSpanExporter`. Cada ejecucion del
-`SyncWorker` produce una linea similar a:
-
-```
-'notes.sync' : <traceId> <spanId> INTERNAL [...]
-AttributesMap{data={
-   service.name=notes-app,
-   sync.attempt=0,
-   sync.pending_count=3,
-   sync.outcome=success
-}, capacity=128, totalAddedValues=4}
-```
-
-![Checkpoint 4 - OTel logcat](screenshots/checkpoint4-otel-logcat.png)
-
----
-
-## Stack tecnico
-
-- Kotlin 1.9.24 + Coroutines 1.8.1
-- Gradle 8.x con Version Catalog (`gradle/libs.versions.toml`)
-- AGP 8.5.2 / compileSdk 34 / minSdk 24
-- Jetpack Compose (BoM 2024.06.00) + Material 3
-- Hilt 2.51.1 + Hilt-Work 1.2.0
-- **Room 2.6.1** (cache local + Flow reactivo)
-- **WorkManager 2.9.0** (sync diferido con constraints + backoff)
-- **OpenTelemetry 1.38.0** (api + sdk + exporter-logging + extension-kotlin)
-- OkHttp 4.12.0 + MockWebServer 4.12.0 (preparados para un backend HTTP real)
+'tasks.sync'
+AttributesMap{
+ sync.attempt=0,
+ sync.pending_count=3,
+ sync.outcome=success
+}
+Evidencia
+Checkpoint 4 - trazas OpenTelemetry
+Stack tecnológico
+Tecnología	Versión
+Kotlin	1.9.24
+Coroutines	1.8.1
+AGP	8.5.2
+Gradle	8.x
+compileSdk	34
+minSdk	24
+Jetpack Compose	BOM 2024.06.00
+Material 3	Última estable
+Hilt	2.51.1
+Hilt Work	1.2.0
+Room	2.6.1
+WorkManager	2.9.0
+OpenTelemetry	1.38.0
+OkHttp	4.12.0
+MockWebServer	4.12.0
